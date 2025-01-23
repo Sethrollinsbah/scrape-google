@@ -1,14 +1,14 @@
 import puppeteer, { Browser, Page } from "puppeteer";
 import { readdir, readFile, writeFile, mkdir, access } from "fs/promises";
 import Papa from "papaparse";
-import { parse } from "csv-parse/sync";
 import fs from "fs";
 import path from "path";
 import { URL } from "url";
 
 // Configuration constants
 const CONFIG = {
-  SEARCH_LIMIT: 20, // Maximum number of CSV links to process
+  OUTPUT: "out" + ".csv",
+  SEARCH_LIMIT: 50, // Maximum number of CSV links to process
   ALLOWED_COLUMN_KEYWORDS: [
     "name",
     "phone",
@@ -151,9 +151,45 @@ class CSVScraper {
 
         const csvContent = await response.text();
         const fileName = this.extractFileName(link);
-        const filePath = path.join(CONFIG.DIRECTORIES.CSV_SAVE, fileName);
-
+        const filePath = path.join(
+          CONFIG.DIRECTORIES.CSV_SAVE,
+          fileName.replaceAll(" ", "-").replaceAll("%20", "-"),
+        );
         await this.processCsvContent(csvContent, filePath);
+        const proc = Bun.spawn({
+          cmd: ["python3", "utils/split.py", filePath, filePath],
+          stdout: "pipe",
+          stderr: "pipe",
+        });
+
+        const { stdout, stderr } = await proc;
+
+        // Function to read a ReadableStream to a string
+        async function streamToString(stream) {
+          const reader = stream.getReader();
+          let decoder = new TextDecoder();
+          let result = "";
+          let done = false;
+
+          while (!done) {
+            const { value, done: readerDone } = await reader.read();
+            result += decoder.decode(value, { stream: true });
+            done = readerDone;
+          }
+
+          result += decoder.decode(); // Finalize decoding
+          return result;
+        }
+
+        if (stderr) {
+          const errorOutput = await streamToString(stderr);
+          console.error("Error output:", errorOutput);
+        }
+
+        if (stdout) {
+          const output = await streamToString(stdout);
+          console.log("Python script output:", output);
+        }
       } catch (error) {
         console.error(`Error processing ${link}:`, error);
       }
@@ -174,6 +210,15 @@ class CSVScraper {
     filePath: string,
   ): Promise<void> {
     try {
+      // Check for forbidden terms in the CSV content
+      const forbiddenTerms = ["agent", "broker", "realtor"];
+      const contentLowerCase = csvContent.toLowerCase();
+
+      if (forbiddenTerms.some((term) => contentLowerCase.includes(term))) {
+        console.log(`Skipping CSV as it mentions forbidden terms: ${filePath}`);
+        return;
+      }
+
       // Parse the CSV with columns
       const { data, meta } = Papa.parse(csvContent, {
         header: true,
@@ -293,6 +338,45 @@ async function main() {
   const searchTerm = args.join(" ");
   const scraper = new CSVScraper();
   await scraper.scrape(searchTerm);
+  const proc = Bun.spawn({
+    cmd: [
+      "python3",
+      "utils/format.py",
+      CONFIG.DIRECTORIES.CSV_SAVE,
+      CONFIG.OUTPUT,
+    ],
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+
+  const { stdout, stderr } = await proc;
+
+  // Function to read a ReadableStream to a string
+  async function streamToString(stream) {
+    const reader = stream.getReader();
+    let decoder = new TextDecoder();
+    let result = "";
+    let done = false;
+
+    while (!done) {
+      const { value, done: readerDone } = await reader.read();
+      result += decoder.decode(value, { stream: true });
+      done = readerDone;
+    }
+
+    result += decoder.decode(); // Finalize decoding
+    return result;
+  }
+
+  if (stderr) {
+    const errorOutput = await streamToString(stderr);
+    console.error("Error output:", errorOutput);
+  }
+
+  if (stdout) {
+    const output = await streamToString(stdout);
+    console.log("Python script output:", output);
+  }
 }
 
 // Utility function for CSV processing
@@ -308,6 +392,7 @@ async function processCsvFiles() {
 
     for (const file of csvFiles) {
       const filePath = path.join(CONFIG.DIRECTORIES.CSV_SAVE, file);
+
       await processCsvFile(filePath);
     }
   } catch (error) {
@@ -315,60 +400,62 @@ async function processCsvFiles() {
   }
 }
 
-// Existing processCsvFile function remains the same as in the original code
 async function processCsvFile(filePath: string) {
   try {
-    // Read the file content
+    // Step 1: Run Python script to preprocess the CSV file
+
     const fileContent = await readFile(filePath, "utf-8");
 
-    // Parse CSV data using PapaParse
+    // Step 3: Parse CSV data using PapaParse
     const { data, meta } = Papa.parse(fileContent, {
       header: true,
       skipEmptyLines: true,
     });
 
-    if (meta.fields) {
-      // Filter columns to only keep those with ALLOWED_COLUMN_KEYWORDS
-      const filteredColumns = meta.fields.filter((field) =>
-        CONFIG.ALLOWED_COLUMN_KEYWORDS.some((keyword) =>
-          field.toLowerCase().includes(keyword),
-        ),
-      );
-
-      // If no columns match the allowed keywords, log and skip
-      if (filteredColumns.length === 0) {
-        console.log(`No allowed columns found in ${filePath}. Skipping.`);
-        return;
-      }
-
-      // Map over each row and retain only the filtered columns
-      const filteredData = data.map((row) => {
-        const filteredRow: Record<string, string> = {};
-        filteredColumns.forEach((column) => {
-          if (column.toLowerCase().includes("phone") && row[column]) {
-            // Clean phone number column by removing non-digit characters
-            filteredRow[column] = cleanPhoneNumber(row[column]);
-          } else {
-            filteredRow[column] = row[column] || ""; // Retain other values as-is
-          }
-        });
-        return filteredRow;
-      });
-
-      // Convert filtered data back to CSV format
-      const filteredCsv = Papa.unparse(filteredData, { header: true });
-
-      // Save the filtered CSV back to the same file
-      await writeFile(filePath, filteredCsv);
-      console.log(
-        `Processed file: ${filePath}, Columns retained: ${filteredColumns.join(", ")}`,
-      );
+    if (!meta.fields) {
+      console.error(`No fields detected in ${filePath}.`);
+      return;
     }
+
+    // Step 4: Filter columns based on allowed keywords
+    const filteredColumns = meta.fields.filter((field) =>
+      CONFIG.ALLOWED_COLUMN_KEYWORDS.some((keyword) =>
+        field.toLowerCase().includes(keyword),
+      ),
+    );
+
+    if (filteredColumns.length === 0) {
+      console.log(`No allowed columns found in ${filePath}. Skipping.`);
+      return;
+    }
+
+    // Step 5: Map and clean data
+    const filteredData = data.map((row) => {
+      const filteredRow: Record<string, string> = {};
+      filteredColumns.forEach((column) => {
+        if (column.toLowerCase().includes("phone") && row[column]) {
+          // Clean phone number column by removing non-digit characters
+          filteredRow[column] = cleanPhoneNumber(row[column]);
+        } else {
+          filteredRow[column] = row[column] || ""; // Retain other values as-is
+        }
+      });
+      return filteredRow;
+    });
+
+    // Step 6: Convert filtered data back to CSV format
+    const filteredCsv = Papa.unparse(filteredData, { header: true });
+
+    // Step 7: Save the filtered CSV back to the file
+    await writeFile(filePath, filteredCsv);
+
+    console.log(
+      `Processed file: ${filePath}, Columns retained: ${filteredColumns.join(", ")}`,
+    );
   } catch (error) {
     console.error(`Error processing file ${filePath}:`, error);
   }
 }
-
 function delay(time) {
   return new Promise(function (resolve) {
     setTimeout(resolve, time);
